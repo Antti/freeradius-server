@@ -174,12 +174,12 @@ RADCLIENT *client_listener_find(const rad_listen_t *listener,
 
 	request->listener = listener;
 	request->client = client;
-	request->packet = rad_alloc(0);
-	if (!request->packet) {
+	request->packet = rad_recv(listener->fd, 0x02); /* MSG_PEEK */
+	if (!request->packet) {				/* badly formed, etc */
 		request_free(&request);
 		goto unknown;
 	}
-	request->reply = rad_alloc(0);
+	request->reply = rad_alloc_reply(request->packet);
 	if (!request->reply) {
 		request_free(&request);
 		goto unknown;
@@ -198,23 +198,6 @@ RADCLIENT *client_listener_find(const rad_listen_t *listener,
 	 *
 	 *	and create the RADCLIENT structure from that.
 	 */
-
-	sock = listener->data;
-	request->packet->sockfd = listener->fd;
-	request->packet->src_ipaddr = *ipaddr;
-	request->packet->src_port = 0; /* who cares... */
-	request->packet->dst_ipaddr = sock->ipaddr;
-	request->packet->dst_port = sock->port;
-
-	request->reply->sockfd = request->packet->sockfd;
-	request->reply->dst_ipaddr = request->packet->src_ipaddr;
-	request->reply->src_ipaddr = request->packet->dst_ipaddr;
-	request->reply->dst_port = request->packet->src_port;
-	request->reply->src_port = request->packet->dst_port;
-	request->reply->id = request->packet->id;
-	request->reply->code = 0; /* UNKNOWN code */
-
-	
 	DEBUG("server %s {", request->server);
 
 	rcode = module_authorize(0, request);
@@ -497,6 +480,11 @@ static int listen_bind(rad_listen_t *this)
 			break;
 #endif
 
+#ifdef WITH_COA
+		case RAD_LISTEN_COA:
+			sock->port = PW_COA_UDP_PORT;
+			break;
+#endif
 		default:
 			radlog(L_ERR, "ERROR: Non-fatal internal sanity check failed in bind.");
 			return -1;
@@ -578,9 +566,12 @@ static int listen_bind(rad_listen_t *this)
 	rcode = bind(this->fd, (struct sockaddr *) &salocal, salen);
 	fr_suid_down();
 	if (rcode < 0) {
+		char buffer[256];
 		close(this->fd);
-		radlog(L_ERR, "Failed binding to socket: %s\n",
-		       strerror(errno));
+		
+		this->print(this, buffer, sizeof(buffer));
+		radlog(L_ERR, "Failed binding to %s: %s\n",
+		       buffer, strerror(errno));
 		return -1;
 	}
 	
@@ -721,6 +712,9 @@ rad_listen_t *listen_alloc(const char *type_name)
 #ifdef WITH_DHCP
 	case RAD_LISTEN_DHCP:
 #endif
+#ifdef WITH_COA
+	case RAD_LISTEN_COA:
+#endif
 		this->data = rad_malloc(sizeof(listen_socket_t));
 		memset(this->data, 0, sizeof(listen_socket_t));
 		break;
@@ -752,67 +746,91 @@ rad_listen_t *listen_alloc(const char *type_name)
 /*
  *	Externally visible function for creating a new proxy LISTENER.
  *
- *	For now, don't take ipaddr or port.
- *
  *	Not thread-safe, but all calls to it are protected by the
- *	proxy mutex in request_list.c
+ *	proxy mutex in event.c
  */
-rad_listen_t *proxy_new_listener()
+rad_listen_t *proxy_new_listener(fr_ipaddr_t *ipaddr, int exists)
 {
 	int last_proxy_port, port;
 	rad_listen_t *this, *tmp, **last;
 	listen_socket_t *sock, *old;
 
-	this = listen_alloc("proxy");
-	if (!this) return NULL;
-
 	/*
 	 *	Find an existing proxy socket to copy.
-	 *
-	 *	FIXME: Make it per-realm, or per-home server!
 	 */
 	last_proxy_port = 0;
 	old = NULL;
 	last = &mainconfig.listen;
 	for (tmp = mainconfig.listen; tmp != NULL; tmp = tmp->next) {
-		if (tmp->type == RAD_LISTEN_PROXY) {
-			sock = tmp->data;
-			if (sock->port > last_proxy_port) {
-				last_proxy_port = sock->port + 1;
-			}
-			if (!old) old = sock;
+		/*
+		 *	Not proxy, ignore it.
+		 */
+		if (tmp->type != RAD_LISTEN_PROXY) continue;
+
+		sock = tmp->data;
+
+		/*
+		 *	If we were asked to copy a specific one, do
+		 *	so.  If we're just finding one that already
+		 *	exists, return a pointer to it.  Otherwise,
+		 *	create ANOTHER one with the same IP address.
+		 */
+		if ((ipaddr->af != AF_UNSPEC) &&
+		    (fr_ipaddr_cmp(&sock->ipaddr, ipaddr) != 0)) {
+			if (exists) return tmp;
+			continue;
 		}
+		
+		if (sock->port > last_proxy_port) {
+			last_proxy_port = sock->port + 1;
+		}
+		if (!old) old = sock;
 
 		last = &(tmp->next);
 	}
 
 	if (!old) {
-		listen_free(&this);
-		return NULL;	/* This is a serious error. */
-	}
+		/*
+		 *	The socket MUST already exist if we're binding
+		 *	to an address while proxying.
+		 *
+		 *	If we're initializing the server, it's OK for the
+		 *	socket to NOT exist.
+		 */
+		if (!exists) return NULL;
 
-	/*
-	 *	FIXME: find a new IP address to listen on?
-	 *
-	 *	This could likely be done in the "home server"
-	 *	configuration, to have per-home-server source IP's.
-	 */
-	sock = this->data;
-	memcpy(&sock->ipaddr, &old->ipaddr, sizeof(sock->ipaddr));
+		this = listen_alloc(RAD_LISTEN_PROXY);
+
+		sock = this->data;
+		sock->ipaddr = *ipaddr;
+
+	} else {
+		this = listen_alloc(RAD_LISTEN_PROXY);
+		
+		sock = this->data;
+		sock->ipaddr = old->ipaddr;
+	}
 
 	/*
 	 *	Keep going until we find an unused port.
 	 */
 	for (port = last_proxy_port; port < 64000; port++) {
+		int rcode;
+
 		sock->port = port;
-		if (listen_bind(this) == 0) {
-			/*
-			 *	Add the new listener to the list of
-			 *	listeners.
-			 */
-			*last = this;
-			return this;
+
+		rcode = listen_bind(this);
+		if (rcode < 0) {
+			listen_free(&this);
+			return NULL;
 		}
+		
+		/*
+		 *	Add the new listener to the list of
+		 *	listeners.
+		 */
+		*last = this;
+		return this;
 	}
 
 	listen_free(&this);
@@ -1142,7 +1160,7 @@ int listen_init(CONF_SECTION *config, rad_listen_t **head)
 		 */
 		if (!*head) return -1;
 
-		if (defined_proxy) goto done;
+		if (defined_proxy) goto check_home_servers;
 
 		/*
 		 *	Find the first authentication port,
@@ -1207,9 +1225,14 @@ int listen_init(CONF_SECTION *config, rad_listen_t **head)
 			radlog(L_ERR, "Failed to open socket for proxying");
 			return -1;
 		}
+		
+		/*
+		 *	Create *additional* proxy listeners, based
+		 *	on their src_ipaddr.
+		 */
+	check_home_servers:
+		if (home_server_create_listeners(*head) != 0) return -1;
 	}
-
- done:			/* used only in proxy code. */
 #endif
 
 	return 0;

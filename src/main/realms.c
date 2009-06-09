@@ -276,6 +276,7 @@ void realms_free(void)
 #ifdef WITH_PROXY
 static struct in_addr hs_ip4addr;
 static struct in6_addr hs_ip6addr;
+static char *hs_srcipaddr = NULL;
 static char *hs_type = NULL;
 static char *hs_check = NULL;
 static char *hs_virtual_server = NULL;
@@ -296,6 +297,9 @@ static CONF_PARSER home_server_config[] = {
 
 	{ "secret",  PW_TYPE_STRING_PTR,
 	  offsetof(home_server,secret), NULL,  NULL},
+
+	{ "src_ipaddr",  PW_TYPE_STRING_PTR,
+	  0, &hs_srcipaddr,  NULL },
 
 	{ "response_window", PW_TYPE_INTEGER,
 	  offsetof(home_server,response_window), NULL,   "30" },
@@ -431,6 +435,8 @@ static int home_server_add(realm_config_t *rc, CONF_SECTION *cs, int pool_type)
 		hs_type = NULL;
 		free(hs_check);
 		hs_check = NULL;
+		free(hs_srcipaddr);
+		hs_srcipaddr = NULL;
 		return 0;
 	}
 
@@ -539,6 +545,19 @@ static int home_server_add(realm_config_t *rc, CONF_SECTION *cs, int pool_type)
 		cf_log_err(cf_sectiontoitem(cs), "Duplicate home server");
 		goto error;
 	}
+
+	/*
+	 *	Look up the name using the *same* address family as
+	 *	for the home server.
+	 */
+	if (hs_srcipaddr && (home->ipaddr.af != AF_UNSPEC)) {
+		if (ip_hton(hs_srcipaddr, home->ipaddr.af, &home->src_ipaddr) < 0) {
+			cf_log_err(cf_sectiontoitem(cs), "Failed parsing src_ipaddr");
+			goto error;
+		}
+	}
+	free(hs_srcipaddr);
+	hs_srcipaddr = NULL;
 
 	if (!rbtree_insert(home_servers_byname, home)) {
 		cf_log_err(cf_sectiontoitem(cs),
@@ -2007,6 +2026,11 @@ home_server *home_server_ldb(const char *realmname,
 			 *	the 'hints' file.
 			 */
 			request->proxy->vps =  paircopy(request->packet->vps);
+
+			/*
+			 *	Set the source IP address for proxying.
+			 */
+			request->proxy->src_ipaddr = found->src_ipaddr;
 		}
 
 		/*
@@ -2134,4 +2158,55 @@ home_pool_t *home_pool_byname(const char *name, int type)
 	return rbtree_finddata(home_pools_byname, &mypool);
 }
 
+#endif
+
+#ifdef WITH_PROXY
+static int home_server_create_callback(void *ctx, void *data)
+{
+	rad_listen_t *head = ctx;
+	home_server *home = data;
+	rad_listen_t *this;
+
+	/*
+	 *	If there WAS a src address defined, ensure that a
+	 *	proxy listener has been defined.
+	 */
+	if (home->src_ipaddr.af != AF_UNSPEC) {
+		this = proxy_new_listener(&home->src_ipaddr, TRUE);
+
+		/*
+		 *	Failed to create it: Die
+		 */
+		if (!this) return 1;
+
+		this->next = head->next;
+		head->next = this;
+	}
+
+	return 0;
+}
+
+/*
+ *	Taking a void* here solves some header issues.
+ */
+int home_server_create_listeners(void *ctx)
+{
+	rad_listen_t *head = ctx;
+
+	if (!home_servers_byaddr) return 0;
+
+	rad_assert(head != NULL);
+
+	/*
+	 *	Add the listeners to the TAIL of the list.
+	 */
+	while (head->next) head = head->next;
+
+	if (rbtree_walk(home_servers_byaddr, InOrder,
+			home_server_create_callback, head) != 0) {
+		return -1;
+	}
+
+	return 0;
+}
 #endif

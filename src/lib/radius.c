@@ -438,19 +438,21 @@ static void make_passwd(uint8_t *output, int *outlen,
 	 *	If the length is zero, round it up.
 	 */
 	len = inlen;
+
+	if (len > MAX_PASS_LEN) len = MAX_PASS_LEN;
+
+	memcpy(passwd, input, len);
+	memset(passwd + len, 0, sizeof(passwd) - len);
+
 	if (len == 0) {
 		len = AUTH_PASS_LEN;
 	}
-	else if (len > MAX_PASS_LEN) len = MAX_PASS_LEN;
 
 	else if ((len & 0x0f) != 0) {
 		len += 0x0f;
 		len &= ~0x0f;
 	}
 	*outlen = len;
-
-	memcpy(passwd, input, len);
-	memset(passwd + len, 0, sizeof(passwd) - len);
 
 	fr_MD5Init(&context);
 	fr_MD5Update(&context, (const uint8_t *) secret, strlen(secret));
@@ -1818,6 +1820,7 @@ int rad_packet_ok(RADIUS_PACKET *packet, int flags)
  */
 RADIUS_PACKET *rad_recv(int fd, int flags)
 {
+	int sock_flags = 0;
 	RADIUS_PACKET		*packet;
 
 	/*
@@ -1829,7 +1832,12 @@ RADIUS_PACKET *rad_recv(int fd, int flags)
 	}
 	memset(packet, 0, sizeof(*packet));
 
-	packet->data_len = rad_recvfrom(fd, &packet->data, 0,
+	if (flags & 0x02) {
+		sock_flags = MSG_PEEK;
+		flags &= ~0x02;
+	}
+
+	packet->data_len = rad_recvfrom(fd, &packet->data, sock_flags,
 					&packet->src_ipaddr, &packet->src_port,
 					&packet->dst_ipaddr, &packet->dst_port);
 

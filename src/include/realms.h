@@ -77,6 +77,8 @@ typedef struct home_server {
 #ifdef WITH_STATS
 	int		number;
 
+	fr_ipaddr_t	src_ipaddr; /* preferred source IP address */
+
 	fr_stats_t	stats;
 
 	fr_stats_ema_t  ema;
@@ -139,6 +141,7 @@ REALM *realm_find2(const char *name); /* ... with name taken from realm_find */
 fr_realm_status_t realm_status(const char *name, int flag);
 home_server *home_server_ldb(const char *realmname, home_pool_t *pool, REQUEST *request);
 home_server *home_server_find(fr_ipaddr_t *ipaddr, int port);
+int	home_server_create_listeners(void *head);
 #ifdef WITH_COA
 home_server *home_server_byname(const char *name);
 #endif
